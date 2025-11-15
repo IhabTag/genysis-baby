@@ -208,3 +208,5 @@ logs/ep*
 
 ep_*
 *.pt
+
+state/*
