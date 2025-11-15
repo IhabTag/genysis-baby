@@ -1,40 +1,47 @@
+import numpy as np
 import torch
-from typing import Optional
 
 
 class EpisodicBuffer:
     """
-    Minimal episodic memory storing projection vectors p_t.
+    Optimized episodic memory storing projection vectors (p_t).
+    Uses a fixed-size circular NumPy array for fast append & retrieval.
 
-    Supports:
-        - append(p_t)
-        - get_memory_tensor() -> (N, proj_dim)
-        - bounded capacity with FIFO removal
+    No slow Python list → tensor conversions.
     """
 
-    def __init__(self, max_size: int = 1000, device: str = "cpu"):
+    def __init__(self, max_size: int = 2000, device: str = "cpu", proj_dim: int = 64):
         self.max_size = max_size
         self.device = device
-        self.memory = []  # list of numpy or torch vectors
+        self.proj_dim = proj_dim
 
-    def add(self, p_vec):
-        """
-        p_vec: torch.Tensor or numpy array of shape (proj_dim,)
-        """
-        if isinstance(p_vec, torch.Tensor):
-            p = p_vec.detach().cpu().numpy()
-        else:
-            p = p_vec
+        # Preallocate memory: (max_size, proj_dim)
+        self.buffer = np.zeros((max_size, proj_dim), dtype=np.float32)
 
-        self.memory.append(p)
-        if len(self.memory) > self.max_size:
-            self.memory.pop(0)
+        self.ptr = 0          # write pointer
+        self.size = 0         # number of items currently stored
 
-    def get_memory_tensor(self) -> Optional[torch.Tensor]:
+    # --------------------------------------------------------------
+    def add(self, vec: np.ndarray):
         """
-        Returns: torch.Tensor (N, proj_dim) on CPU.
+        vec: (proj_dim,) numpy float32
         """
-        if len(self.memory) == 0:
+        assert vec.shape[-1] == self.proj_dim, (
+            f"Expected projection dim {self.proj_dim}, got {vec.shape[-1]}"
+        )
+
+        self.buffer[self.ptr] = vec
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+
+    # --------------------------------------------------------------
+    def get_memory_tensor(self):
+        """
+        Returns Tensor (size, proj_dim) on the correct device.
+        """
+        if self.size == 0:
             return None
-        arr = torch.tensor(self.memory, dtype=torch.float32)
-        return arr.to(self.device)
+
+        mem_np = self.buffer[:self.size]  # view, no copy
+        mem_t = torch.from_numpy(mem_np).to(self.device)
+        return mem_t
