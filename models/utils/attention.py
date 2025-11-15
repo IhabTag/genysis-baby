@@ -145,3 +145,72 @@ class SaliencyAttention:
 
         regions.sort(key=lambda r: r["score"], reverse=True)
         return regions[: self.num_regions]
+
+    # --------------------------------------------------------
+    # NEW: Extract patches from top salient regions
+    # --------------------------------------------------------
+    def extract_patches(
+        self,
+        frame: np.ndarray,
+        att_map: np.ndarray,
+        regions: List[Dict],
+        patch_size: int = 128,
+        max_patches: int = 5,
+    ) -> Tuple[List[np.ndarray], List[Dict]]:
+        """
+        Given:
+          - frame: RGB uint8 (H,W,3)
+          - att_map: (H,W) float32 in [0,1]
+          - regions: list of {x1,x2,y1,y2,score}
+        Returns:
+          - patches: list of RGB uint8 (patch_size, patch_size, 3)
+          - infos:   list of dicts:
+                     {
+                       "bbox": (y1, y2, x1, x2),
+                       "score": float,
+                       "center": (cy, cx)
+                     }
+        """
+        h, w, _ = frame.shape
+        patches: List[np.ndarray] = []
+        infos: List[Dict] = []
+
+        for r in regions[:max_patches]:
+            y1, y2 = r["y1"], r["y2"]
+            x1, x2 = r["x1"], r["x2"]
+            score = r.get("score", 0.0)
+
+            # Compute center of the region
+            cy = (y1 + y2) // 2
+            cx = (x1 + x2) // 2
+
+            # Define a square patch around the center
+            half = max((y2 - y1), (x2 - x1)) // 2
+            half = max(half, patch_size // 4)  # avoid too tiny patches
+
+            top = max(cy - half, 0)
+            bottom = min(cy + half, h)
+            left = max(cx - half, 0)
+            right = min(cx + half, w)
+
+            region_patch = frame[top:bottom, left:right, :]
+            if region_patch.size == 0:
+                continue
+
+            # Resize to (patch_size, patch_size)
+            patch_resized = cv2.resize(
+                region_patch,
+                (patch_size, patch_size),
+                interpolation=cv2.INTER_AREA,
+            )
+
+            patches.append(patch_resized)
+            infos.append(
+                {
+                    "bbox": (int(top), int(bottom), int(left), int(right)),
+                    "score": float(score),
+                    "center": (int(cy), int(cx)),
+                }
+            )
+
+        return patches, infos
