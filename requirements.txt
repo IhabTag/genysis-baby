@@ -1,0 +1,26 @@
+# Core ML
+torch==2.1.0
+torchvision==0.16.0
+
+# Image processing
+opencv-python==4.8.1.78
+Pillow==10.0.1
+matplotlib==3.8.0
+
+# Numerical / data
+numpy==1.25.2
+scipy==1.11.3
+
+# Environment control
+mss==9.0.1
+pyautogui==0.9.54
+pynput==1.7.6
+python-xlib==0.33
+
+# Utilities
+tqdm==4.66.1
+psutil==5.9.5
+pyyaml==6.0.1
+
+# Debug tools
+ipython

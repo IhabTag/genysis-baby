@@ -1,0 +1,28 @@
+# Ignore Python venv
+venv/
+*/venv/
+
+# Ignore virtual environments
+.env/
+*.egg-info/
+
+# Ignore datasets & logs (optional but recommended)
+datasets/
+logs/
+
+# Ignore __pycache__
+__pycache__/
+*/__pycache__/
+
+# Ignore model checkpoints
+checkpoints/
+models/*.pt
+models/*.pth
+
+# Ignore compiled junk
+*.pyc
+
+# Ignore build artifacts
+tmp/
+temp/
+.cache/
