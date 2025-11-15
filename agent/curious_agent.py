@@ -2,13 +2,14 @@ import numpy as np
 import torch
 import cv2
 
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional, List
 
 from models.utils.preprocessing import preprocess_frame, encode_action
 from models.utils.attention import SaliencyAttention
 from memory.episodic_buffer import EpisodicBuffer
 from memory.text_memory import TextMemory
 from agent.screen_interpreter import ScreenInterpreter
+from agent.text_actions import TextActionAgent  # Step 15: semantic actions
 
 
 class CuriousAgent:
@@ -24,9 +25,13 @@ class CuriousAgent:
       3) Attention change:          ||A_pred - A_t||^2
 
     TextMemory is updated every time select_action() is called
-    using the ScreenInterpreter (OCR over salient patches),
-    but it is not yet used to bias actions—that will come in
-    the next phase (text-guided control).
+    using the ScreenInterpreter (OCR over salient patches).
+
+    Step 15 extension:
+      - The agent can optionally be wired to a TextActionAgent
+        to perform semantic actions like:
+          * find_and_click("Search")
+          * type_into("Search", "hello world")
     """
 
     def __init__(
@@ -40,6 +45,7 @@ class CuriousAgent:
         novelty_weight: float = 0.5,
         attention_weight: float = 0.4,
         epsilon: float = 0.1,
+        text_action_agent: Optional[TextActionAgent] = None,
     ):
         """
         Args:
@@ -52,6 +58,7 @@ class CuriousAgent:
           novelty_weight: weight for novelty
           attention_weight: weight for attention change
           epsilon: epsilon-greedy exploration probability
+          text_action_agent: optional TextActionAgent instance for semantic actions
         """
         self.world_model = world_model.to(device)
         self.world_model.eval()
@@ -70,6 +77,9 @@ class CuriousAgent:
         self.text_memory = TextMemory()
         self.screen_interpreter = ScreenInterpreter()
 
+        # Optional semantic-action layer (Step 15)
+        self.text_action_agent: Optional[TextActionAgent] = text_action_agent
+
         # Curiosity weights
         self.local_weight = local_weight
         self.novelty_weight = novelty_weight
@@ -81,6 +91,19 @@ class CuriousAgent:
         # Action diversity tracking
         self.action_counts: Dict[str, int] = {}
         self.last_action_type: Any = None
+
+    # --------------------------------------------------------
+    # Wiring / integration helpers
+    # --------------------------------------------------------
+    def attach_text_action_agent(self, taa: TextActionAgent) -> None:
+        """
+        Attach a TextActionAgent after construction.
+
+        Typical pattern:
+            taa = TextActionAgent(executor, screen_interpreter, text_memory)
+            agent.attach_text_action_agent(taa)
+        """
+        self.text_action_agent = taa
 
     # --------------------------------------------------------
     # Memory: remember visited projection states
@@ -101,6 +124,28 @@ class CuriousAgent:
         p_vec = p_t.squeeze(0).cpu().numpy()
 
         self.memory.add(p_vec)
+
+    # --------------------------------------------------------
+    # Internal helper: update TextMemory from current frame
+    # --------------------------------------------------------
+    def _update_text_memory(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        Runs OCR+attention via ScreenInterpreter and pushes all
+        visible text segments into TextMemory.
+
+        Returns:
+          list of screen elements (same structure as ScreenInterpreter.interpret)
+        """
+        screen_elems = self.screen_interpreter.interpret(frame)
+        for elem in screen_elems:
+            self.text_memory.add(
+                text=elem["text"],
+                bbox=elem["bbox"],
+                center=elem["center"],
+                score=elem["score"],
+                embedding=None,  # can be wired to patch embeddings later
+            )
+        return screen_elems
 
     # --------------------------------------------------------
     # Core: select action based on curiosity
@@ -125,15 +170,7 @@ class CuriousAgent:
         # ----------------------------------------------------
         # 0) OCR + text memory (proto-reading)
         # ----------------------------------------------------
-        screen_elems = self.screen_interpreter.interpret(frame)
-        for elem in screen_elems:
-            self.text_memory.add(
-                text=elem["text"],
-                bbox=elem["bbox"],
-                center=elem["center"],
-                score=elem["score"],
-                embedding=None,  # can be wired to patch embeddings later
-            )
+        self._update_text_memory(frame)
 
         # ----------------------------------------------------
         # 1) Preprocess current frame once
@@ -161,7 +198,7 @@ class CuriousAgent:
         best_score = -float("inf")
 
         # ----------------------------------------------------
-        # 2) Try multiple candidate actions
+        # 2) Try multiple candidate actions (motor-space search)
         # ----------------------------------------------------
         for _ in range(self.n_candidates):
             action = self.action_generator()
@@ -245,3 +282,48 @@ class CuriousAgent:
             return random_act, 0.0
 
         return best_action, best_score
+
+    # --------------------------------------------------------
+    # Step 15: Semantic / Text-guided helpers
+    # --------------------------------------------------------
+    def get_visible_text(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        Returns structured list of all visible text elements
+        based on ScreenInterpreter + TextMemory update.
+        """
+        elems = self._update_text_memory(frame)
+        return elems
+
+    def semantic_find_and_click(self, frame: np.ndarray, text: str) -> bool:
+        """
+        Use attached TextActionAgent (if present) to:
+          - re-run OCR on frame
+          - find closest text match
+          - emit the appropriate actions (inside TextActionAgent)
+
+        Returns True if something was clicked, False otherwise.
+        """
+        if self.text_action_agent is None:
+            raise RuntimeError(
+                "No TextActionAgent attached. "
+                "Call agent.attach_text_action_agent(...) first."
+            )
+        return self.text_action_agent.find_and_click(frame, text)
+
+    def semantic_type_into(
+        self,
+        frame: np.ndarray,
+        target_text: str,
+        content: str,
+    ) -> bool:
+        """
+        Use attached TextActionAgent to:
+          - click UI element matching target_text
+          - type the provided content
+        """
+        if self.text_action_agent is None:
+            raise RuntimeError(
+                "No TextActionAgent attached. "
+                "Call agent.attach_text_action_agent(...) first."
+            )
+        return self.text_action_agent.type_into(frame, target_text, content)

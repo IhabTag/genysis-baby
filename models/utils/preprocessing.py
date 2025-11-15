@@ -147,3 +147,62 @@ class ExperienceDataset(Dataset):
         act_vec_t = torch.from_numpy(act_vec)       # (5,)
 
         return img_t_t, act_vec_t, img_next_t
+
+def preprocess_frame(frame: np.ndarray, size: int = 128) -> np.ndarray:
+    """
+    Converts RGB frame (H,W,3) into (3,size,size) float32 normalized.
+    """
+    img = cv2.resize(frame, (size, size))
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    return img
+
+
+def preprocess_frame_diff(frame_a: np.ndarray, frame_b: np.ndarray) -> float:
+    """
+    Compute normalized pixel difference between two RGB frames.
+
+    Returns:
+        float in [0, 1], higher = bigger change.
+    """
+    if frame_a is None or frame_b is None:
+        return 1.0
+
+    if frame_a.shape != frame_b.shape:
+        return 1.0
+
+    # Convert to grayscale for difference metric
+    gray_a = cv2.cvtColor(frame_a, cv2.COLOR_RGB2GRAY)
+    gray_b = cv2.cvtColor(frame_b, cv2.COLOR_RGB2GRAY)
+
+    diff = cv2.absdiff(gray_a, gray_b)
+    diff_norm = np.mean(diff) / 255.0  # normalize
+
+    return float(diff_norm)
+
+
+def encode_action(action: dict, screen_width: int, screen_height: int) -> np.ndarray:
+    """
+    Encode action dict into numerical vector.
+    """
+    vec = np.zeros(6, dtype=np.float32)
+
+    a_type = action.get("type", "")
+
+    if a_type == "MOVE_MOUSE":
+        vec[0] = 1.0
+        vec[1] = action.get("x", 0) / screen_width
+        vec[2] = action.get("y", 0) / screen_height
+
+    elif a_type == "LEFT_CLICK":
+        vec[3] = 1.0
+
+    elif a_type == "RIGHT_CLICK":
+        vec[4] = 1.0
+
+    elif a_type == "SCROLL":
+        vec[5] = action.get("amount", 0) / 100.0
+
+    # TYPE_TEXT not encoded yet (handled at high-level)
+    return vec
+

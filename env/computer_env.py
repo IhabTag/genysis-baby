@@ -10,21 +10,23 @@ from .logging import EpisodeLogger
 
 class ComputerEnv:
     """
-    A minimal gym-like environment representing the AGI baby's world:
+    Minimal gym-like environment for the AGI baby's world.
 
-      - Observation: RGB desktop frame (H, W, 3) as uint8
-      - Action: dict interpreted by ActionExecutor
-      - Reward: currently always 0.0 (curiosity is handled outside)
-      - Done: episode length exceeded (max_steps)
+    Observations are now dicts:
 
-    This is intentionally simple and "dumb".
-    All intelligence is in the models, curiosity, and agents.
+        {
+            "image": np.ndarray (H,W,3) RGB uint8,
+            "t": step_index
+        }
+
+    This matches all Phase-3 agents, instruction agents,
+    text-action agents, curiosity modules, etc.
     """
 
     def __init__(
         self,
-        width: int = 1024,
-        height: int = 768,
+        width: int = 1280,
+        height: int = 1024,
         max_steps: int = 200,
         log_dir: str = "logs",
         action_delay: float = 0.02,
@@ -47,16 +49,24 @@ class ComputerEnv:
     # --------------------------------------------------------
     # Internal: capture observation
     # --------------------------------------------------------
-    def _observe(self) -> np.ndarray:
+    def _observe(self) -> Dict[str, Any]:
+        """
+        Return a dict with:
+          - image: RGB frame
+          - t: current timestep
+        """
         img = self.capturer.capture()
-        return img
+        return {
+            "image": img,
+            "t": self.t
+        }
 
     # --------------------------------------------------------
     # Public API: reset / step
     # --------------------------------------------------------
-    def reset(self, meta: Dict[str, Any] = None) -> np.ndarray:
+    def reset(self, meta: Dict[str, Any] = None) -> Dict[str, Any]:
         """
-        Start a new episode and return initial observation (RGB image).
+        Start a new episode and return the first observation dict.
         """
         if meta is None:
             meta = {}
@@ -68,13 +78,10 @@ class ComputerEnv:
         obs = self._observe()
         return obs
 
-    def step(self, action: Dict[str, Any]) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+    def step(self, action: Dict[str, Any]) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """
         Execute `action`, capture next observation, and return:
-          (obs_next, reward, done, info)
-
-        - `reward` is always 0.0 here.
-          Curiosity/intrinsic reward is computed in the agent/memory modules.
+          (obs_next_dict, reward, done, info)
         """
         if not self.active:
             raise RuntimeError("Environment not active. Call reset() before step().")
@@ -87,7 +94,7 @@ class ComputerEnv:
         # 2. Increment step counter
         self.t += 1
 
-        # 3. Capture new observation
+        # 3. Capture new observation dict
         obs_next = self._observe()
 
         # 4. Reward + termination
