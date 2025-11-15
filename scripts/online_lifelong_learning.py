@@ -162,15 +162,17 @@ def main():
     # Create environment
     env = ComputerEnv(width=1024, height=768, max_steps=150)
 
-    # Create agent
+    # Create agent (FAST MODE)
     agent = CuriousAgent(
         world_model=world_model,
         action_generator=lambda: random_action(width=1024, height=768),
-        n_candidates=6,
+        n_candidates=4,          # fewer candidates → faster
         device=device,
         max_memory=1500,
         epsilon=0.05,
         proj_dim=64,
+        fast_mode=True,         # skip OCR+goal on predictions
+        mem_sample_size=512,    # sample episodic memory for novelty
     )
 
     # Load persistent agent state (episodic + text + goals + meta)
@@ -229,7 +231,7 @@ def main():
             # Advance
             frame = next_frame
             step += 1
-            total_steps += 1  # ✅ global age counter
+            total_steps += 1  # global age counter
 
             if step % 10 == 0:
                 print(

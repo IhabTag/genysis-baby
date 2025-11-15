@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+from typing import Optional
 
 
 class EpisodicBuffer:
@@ -8,7 +9,8 @@ class EpisodicBuffer:
     Optimized episodic memory storing projection vectors (p_t).
     Uses a fixed-size circular NumPy array for fast append & retrieval.
 
-    Now with save/load support for persistent lifelong memory.
+    Now with save/load support for persistent lifelong memory,
+    and optional sampling to keep per-step cost small.
     """
 
     def __init__(
@@ -41,14 +43,22 @@ class EpisodicBuffer:
         self.size = min(self.size + 1, self.max_size)
 
     # --------------------------------------------------------------
-    def get_memory_tensor(self):
+    def get_memory_tensor(self, sample_size: Optional[int] = None):
         """
-        Returns Tensor (size, proj_dim) on the correct device.
+        Returns Tensor (N, proj_dim) on the correct device.
+
+        If sample_size is provided and size > sample_size,
+        returns a random subset of that size to keep computation cheap.
         """
         if self.size == 0:
             return None
 
-        mem_np = self.buffer[:self.size]  # view, no copy
+        if sample_size is not None and self.size > sample_size:
+            idx = np.random.choice(self.size, size=sample_size, replace=False)
+            mem_np = self.buffer[idx]
+        else:
+            mem_np = self.buffer[:self.size]  # view, no copy
+
         mem_t = torch.from_numpy(mem_np).to(self.device)
         return mem_t
 

@@ -18,7 +18,7 @@ from agent.goal_head import GoalCuriosityHead
 
 class CuriousAgent:
     """
-    Redesigned curiosity-driven agent with persistent memory.
+    Curiosity-driven agent with persistent memory and a fast-mode path.
 
     Curiosity score per candidate action is a mixture of:
       1) Latent change       : ||p_{t+1} - p_t||^2
@@ -39,6 +39,8 @@ class CuriousAgent:
           * text memory
           * goal memory
           * action stats
+      - fast_mode to skip expensive OCR/goal evaluations on predicted frames
+      - mem_sample_size to keep novelty computation cheap
     """
 
     def __init__(
@@ -58,6 +60,8 @@ class CuriousAgent:
         boredom_window: int = 50,
         boredom_factor: float = 0.5,
         proj_dim: int = 64,
+        fast_mode: bool = True,
+        mem_sample_size: int = 512,
     ):
         """
         Args:
@@ -71,6 +75,8 @@ class CuriousAgent:
           boredom_window: how many past curiosity scores to consider
           boredom_factor: threshold ratio for boredom
           proj_dim: projection dimension for episodic memory
+          fast_mode: if True, skip OCR/goal eval on predicted frames
+          mem_sample_size: max number of memory states used for novelty
         """
         self.world_model = world_model.to(device)
         self.world_model.eval()
@@ -114,6 +120,10 @@ class CuriousAgent:
 
         # Goal curiosity head
         self.goal_head = GoalCuriosityHead()
+
+        # Speed / performance knobs
+        self.fast_mode = fast_mode
+        self.mem_sample_size = mem_sample_size
 
     # --------------------------------------------------------
     # Utility: text signatures
@@ -264,13 +274,13 @@ class CuriousAgent:
         Given current RGB frame (H,W,3), chooses the most curious action.
 
         Also:
-          - Runs OCR via ScreenInterpreter
+          - Runs OCR via ScreenInterpreter on current frame
           - Updates TextMemory with visible text segments
           - Computes multi-factor curiosity for each candidate
 
-        Returns:
-          best_action: dict
-          curiosity_score: float
+        In fast_mode:
+          - OCR and goal curiosity on predicted frames are skipped
+          - Text novelty and goal curiosity are effectively 0 for predictions.
         """
         assert isinstance(frame, np.ndarray), "Expected numpy array frame"
         assert frame.ndim == 3 and frame.shape[2] == 3, "Expected RGB frame HxWx3"
@@ -278,7 +288,7 @@ class CuriousAgent:
         H, W, _ = frame.shape
 
         # ----------------------------------------------------
-        # 0) Interpret screen & update text memory
+        # 0) Interpret screen & update text memory (current frame only)
         # ----------------------------------------------------
         screen_elems = self.screen_interpreter.interpret(frame)
         for elem in screen_elems:
@@ -287,10 +297,10 @@ class CuriousAgent:
                 bbox=elem["bbox"],
                 center=elem["center"],
                 score=elem["score"],
-                embedding=None,  # patch embeddings can be wired later
+                embedding=None,
             )
 
-        # Text + layout signatures (for text/layout curiosity and goals)
+        # Text + layout signatures (for current frame)
         text_sig_t = self._text_signature(screen_elems)
         layout_sig_t = self._layout_signature(frame)
 
@@ -316,8 +326,8 @@ class CuriousAgent:
         z_t = self.world_model.encode(img_t)        # (1,latent)
         p_t = self.world_model.project(z_t)         # (1,proj_dim)
 
-        # Episodic memory tensor
-        mem_tensor = self.memory.get_memory_tensor()
+        # Episodic memory tensor (possibly sampled)
+        mem_tensor = self.memory.get_memory_tensor(sample_size=self.mem_sample_size)
 
         # Remember current state in episodic memory
         self.remember_state(frame)
@@ -372,36 +382,39 @@ class CuriousAgent:
                 (A_pred_tensor - A_t_tensor) ** 2
             ).item()
 
-            # 4) Text (OCR) novelty
-            try:
-                ocr_next = run_ocr_with_boxes(pred_img_resized)
-                text_sig_next = self._text_signature(ocr_next)
-                if text_sig_t or text_sig_next:
-                    new_tokens = text_sig_next - text_sig_t
-                    text_novelty = len(new_tokens) / max(1, len(text_sig_next))
-                else:
+            # Defaults for fast_mode
+            text_novelty = 0.0
+            layout_diff = float(np.mean(
+                (self._layout_signature(pred_img_resized) - layout_sig_t) ** 2
+            ))
+            goal_curiosity = 0.0
+
+            # 4 & 6) Only do heavy OCR & goal curiosity on predictions if NOT in fast_mode
+            if not self.fast_mode:
+                try:
+                    ocr_next = run_ocr_with_boxes(pred_img_resized)
+                    text_sig_next = self._text_signature(ocr_next)
+                    if text_sig_t or text_sig_next:
+                        new_tokens = text_sig_next - text_sig_t
+                        text_novelty = len(new_tokens) / max(1, len(text_sig_next))
+                    else:
+                        text_novelty = 0.0
+                except Exception:
+                    ocr_next = []
+                    text_sig_next = set()
                     text_novelty = 0.0
-            except Exception:
-                ocr_next = []
-                text_sig_next = set()
-                text_novelty = 0.0
 
-            # 5) Layout (structural) novelty
-            layout_sig_next = self._layout_signature(pred_img_resized)
-            layout_diff = float(np.mean((layout_sig_next - layout_sig_t) ** 2))
+                num_windows_next = len(ocr_next)
+                cursor_mode_next = cursor_mode_t
 
-            # 6) Goal curiosity (competence-based)
-            num_windows_next = len(ocr_next)  # placeholder; could be improved
-            cursor_mode_next = cursor_mode_t  # same for now
-
-            features_next = self.goal_head.extract_features(
-                ocr_tokens=list(text_sig_next),
-                layout_vec=layout_sig_next,
-                num_windows=num_windows_next,
-                cursor_mode=cursor_mode_next,
-                screen_elems=ocr_next,
-            )
-            goal_curiosity = self.goal_head.compute_goal_curiosity(features_next)
+                features_next = self.goal_head.extract_features(
+                    ocr_tokens=list(text_sig_next),
+                    layout_vec=self._layout_signature(pred_img_resized),
+                    num_windows=num_windows_next,
+                    cursor_mode=cursor_mode_next,
+                    screen_elems=ocr_next,
+                )
+                goal_curiosity = self.goal_head.compute_goal_curiosity(features_next)
 
             # Combined curiosity
             score = (
@@ -446,25 +459,24 @@ class CuriousAgent:
                 import random
                 # Override with an exploration-heavy action
                 if random.random() < 0.5:
-                    # Big mouse move
                     explore_action: Dict[str, Any] = {
                         "type": "MOVE_MOUSE",
                         "x": np.random.randint(0, W),
                         "y": np.random.randint(0, H),
                     }
                 else:
-                    # Big scroll
                     explore_action = {
                         "type": "SCROLL",
                         "amount": random.choice([-400, -250, 250, 400]),
                     }
                 best_action = explore_action
-                best_score = 0.0  # neutral curiosity but high exploration value
+                best_score = 0.0
 
         # Epsilon-greedy random exploration (if external generator exists)
         if self.action_generator is not None and np.random.rand() < self.epsilon:
             try:
-                random_act = self.action_generator()
+                from agent.random_agent import random_action
+                random_act = random_action(width=W, height=H)
                 return random_act, 0.0
             except Exception:
                 pass
@@ -507,6 +519,8 @@ class CuriousAgent:
             "action_counts": self.action_counts,
             "last_action_type": self.last_action_type,
             "recent_scores": list(self.recent_scores),
+            "fast_mode": self.fast_mode,
+            "mem_sample_size": self.mem_sample_size,
         }
         meta_path = os.path.join(state_dir, "agent_meta.json")
         with open(meta_path, "w", encoding="utf-8") as f:
@@ -539,3 +553,6 @@ class CuriousAgent:
             self.recent_scores.clear()
             for s in meta.get("recent_scores", []):
                 self.recent_scores.append(float(s))
+            # Respect persisted fast_mode / mem_sample_size if present
+            self.fast_mode = bool(meta.get("fast_mode", self.fast_mode))
+            self.mem_sample_size = int(meta.get("mem_sample_size", self.mem_sample_size))
