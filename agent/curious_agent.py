@@ -7,6 +7,8 @@ from typing import Tuple, Dict, Any
 from models.utils.preprocessing import preprocess_frame, encode_action
 from models.utils.attention import SaliencyAttention
 from memory.episodic_buffer import EpisodicBuffer
+from memory.text_memory import TextMemory
+from agent.screen_interpreter import ScreenInterpreter
 
 
 class CuriousAgent:
@@ -14,14 +16,17 @@ class CuriousAgent:
     Curiosity-driven agent operating in:
       - contrastive projection space (p_t)
       - attention space (A_t)
+      - high-level text space (via TextMemory)
 
     Curiosity score per candidate action is a combination of:
       1) Local latent change:       ||p_{t+1} - p_t||^2
       2) Novelty vs episodic memory (min distance in projection space)
       3) Attention change:          ||A_pred - A_t||^2
 
-    This agent does not use external reward.
-    It selects actions purely based on intrinsic curiosity.
+    TextMemory is updated every time select_action() is called
+    using the ScreenInterpreter (OCR over salient patches),
+    but it is not yet used to bias actions—that will come in
+    the next phase (text-guided control).
     """
 
     def __init__(
@@ -61,6 +66,10 @@ class CuriousAgent:
         # Visual attention
         self.att_module = SaliencyAttention()
 
+        # Text-level perception and memory
+        self.text_memory = TextMemory()
+        self.screen_interpreter = ScreenInterpreter()
+
         # Curiosity weights
         self.local_weight = local_weight
         self.novelty_weight = novelty_weight
@@ -70,8 +79,8 @@ class CuriousAgent:
         self.epsilon = epsilon
 
         # Action diversity tracking
-        self.action_counts = {}
-        self.last_action_type = None
+        self.action_counts: Dict[str, int] = {}
+        self.last_action_type: Any = None
 
     # --------------------------------------------------------
     # Memory: remember visited projection states
@@ -83,7 +92,9 @@ class CuriousAgent:
         frame: RGB uint8 (H,W,3)
         """
         img_np = preprocess_frame(frame)  # (3,H,W), float32
-        img_t = torch.tensor(img_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        img_t = torch.tensor(
+            img_np, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
 
         z_t = self.world_model.encode(img_t)
         p_t = self.world_model.project(z_t)  # (1,proj_dim)
@@ -99,15 +110,38 @@ class CuriousAgent:
         """
         Given current RGB frame (H,W,3), chooses the most curious action.
 
+        Also:
+          - Runs OCR on salient patches
+          - Updates TextMemory with visible text segments
+
         Returns:
           best_action: dict
           curiosity_score: float
         """
         assert frame.ndim == 3 and frame.shape[2] == 3, "Expected RGB frame HxWx3 RGB"
 
-        # Preprocess current frame once
+        H, W, _ = frame.shape
+
+        # ----------------------------------------------------
+        # 0) OCR + text memory (proto-reading)
+        # ----------------------------------------------------
+        screen_elems = self.screen_interpreter.interpret(frame)
+        for elem in screen_elems:
+            self.text_memory.add(
+                text=elem["text"],
+                bbox=elem["bbox"],
+                center=elem["center"],
+                score=elem["score"],
+                embedding=None,  # can be wired to patch embeddings later
+            )
+
+        # ----------------------------------------------------
+        # 1) Preprocess current frame once
+        # ----------------------------------------------------
         img_np = preprocess_frame(frame)  # (3,H,W)
-        img_t = torch.tensor(img_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        img_t = torch.tensor(
+            img_np, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
 
         # Current attention map
         A_t, _ = self.att_module.compute(frame, prev_frame=None)
@@ -119,14 +153,15 @@ class CuriousAgent:
         # Episodic memory tensor
         mem_tensor = self.memory.get_memory_tensor()
 
-        H, W, _ = frame.shape
-        A_t_tensor = torch.tensor(A_t, dtype=torch.float32, device=self.device)
+        A_t_tensor = torch.tensor(
+            A_t, dtype=torch.float32, device=self.device
+        )
 
         best_action = None
         best_score = -float("inf")
 
         # ----------------------------------------------------
-        # Try multiple candidate actions
+        # 2) Try multiple candidate actions
         # ----------------------------------------------------
         for _ in range(self.n_candidates):
             action = self.action_generator()
@@ -159,12 +194,20 @@ class CuriousAgent:
             pred_img_np = np.clip(pred_img_np * 255.0, 0, 255).astype(np.uint8)
 
             # resize to match original frame size
-            pred_img_resized = cv2.resize(pred_img_np, (W, H), interpolation=cv2.INTER_AREA)
+            pred_img_resized = cv2.resize(
+                pred_img_np, (W, H), interpolation=cv2.INTER_AREA
+            )
 
-            A_pred, _ = self.att_module.compute(pred_img_resized, prev_frame=frame)
-            A_pred_tensor = torch.tensor(A_pred, dtype=torch.float32, device=self.device)
+            A_pred, _ = self.att_module.compute(
+                pred_img_resized, prev_frame=frame
+            )
+            A_pred_tensor = torch.tensor(
+                A_pred, dtype=torch.float32, device=self.device
+            )
 
-            att_change = torch.mean((A_pred_tensor - A_t_tensor) ** 2).item()
+            att_change = torch.mean(
+                (A_pred_tensor - A_t_tensor) ** 2
+            ).item()
 
             # Combined curiosity
             score = (
@@ -185,7 +228,9 @@ class CuriousAgent:
                 best_score = score
                 best_action = action
 
-        # Update diversity stats
+        # ----------------------------------------------------
+        # 3) Update diversity stats and epsilon-greedy
+        # ----------------------------------------------------
         if best_action is None:
             best_action = {"type": "NOOP"}
 
@@ -195,7 +240,6 @@ class CuriousAgent:
 
         # Epsilon-greedy random exploration
         if np.random.rand() < self.epsilon:
-            # We only dodge catastrophic NOOP replacing
             from agent.random_agent import random_action
             random_act = random_action(width=W, height=H)
             return random_act, 0.0

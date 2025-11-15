@@ -224,3 +224,17 @@ Everything working inside a controlled VM-like sandbox.
 ======================
 
 L`   genysis-baby/    env/      obs.py      actions.py      logging.py      computer_env.py    models/      world_model.py      utils/        preprocessing.py        encoder_blocks.py        projection_head.py        dynamics.py        attention.py    memory/      curiosity.py      episodic_buffer.py    agent/      random_agent.py      curious_agent.py    scripts/      collect_random_dataset.py      train_world_model_contrastive.py      run_world_model_inference.py      run_curious_training.py      test_curious_agent.py      debug/        test_obs.py        test_actions.py        test_attn.py        print_shapes.py    requirements.txt    README.md   `
+
+For phase 3 step 13 - OCR
+
+⚠️ One-time requirements (outside Python)
+-----------------------------------------
+
+You’ll need Tesseract and pytesseract:
+
+`   # Inside the container (as root or via sudo)`  
+`apt-get update  apt-get install -y tesseract-ocr`  
+`# As agent in the venv`  
+`source ~/venv/bin/activate`  
+`# or your actual venv path`  
+`pip install pytesseract   `
