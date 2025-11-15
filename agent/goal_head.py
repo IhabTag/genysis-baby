@@ -1,6 +1,8 @@
 import numpy as np
 from typing import Dict, Any, List
 import hashlib
+import os
+import json
 
 
 class GoalCuriosityHead:
@@ -15,6 +17,8 @@ class GoalCuriosityHead:
 
     Each "goal state" is summarized into a signature.
     Novelty of that signature drives goal curiosity.
+
+    Now with save/load for persistence.
     """
 
     def __init__(self, max_goals: int = 5000):
@@ -72,3 +76,27 @@ class GoalCuriosityHead:
             novelty = self.known_goals[sig]
 
         return float(novelty)
+
+    # -------------------------------------------------------------
+    # Persistence
+    # -------------------------------------------------------------
+    def to_dict(self) -> Dict[str, float]:
+        return dict(self.known_goals)
+
+    def from_dict(self, data: Dict[str, float]):
+        if data is None:
+            self.known_goals = {}
+        else:
+            self.known_goals = {str(k): float(v) for k, v in data.items()}
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+
+    def load(self, path: str):
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.from_dict(data)

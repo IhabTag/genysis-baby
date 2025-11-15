@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 
@@ -7,10 +8,15 @@ class EpisodicBuffer:
     Optimized episodic memory storing projection vectors (p_t).
     Uses a fixed-size circular NumPy array for fast append & retrieval.
 
-    No slow Python list → tensor conversions.
+    Now with save/load support for persistent lifelong memory.
     """
 
-    def __init__(self, max_size: int = 2000, device: str = "cpu", proj_dim: int = 64):
+    def __init__(
+        self,
+        max_size: int = 2000,
+        device: str = "cpu",
+        proj_dim: int = 64,
+    ):
         self.max_size = max_size
         self.device = device
         self.proj_dim = proj_dim
@@ -45,3 +51,48 @@ class EpisodicBuffer:
         mem_np = self.buffer[:self.size]  # view, no copy
         mem_t = torch.from_numpy(mem_np).to(self.device)
         return mem_t
+
+    # --------------------------------------------------------------
+    # Persistence
+    # --------------------------------------------------------------
+    def save(self, path: str):
+        """
+        Save episodic buffer to disk (npz).
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez(
+            path,
+            buffer=self.buffer,
+            ptr=self.ptr,
+            size=self.size,
+            proj_dim=self.proj_dim,
+            max_size=self.max_size,
+        )
+
+    def load(self, path: str):
+        """
+        Load episodic buffer from disk if file exists.
+        """
+        if not os.path.exists(path):
+            return
+
+        data = np.load(path)
+        buf = data["buffer"]
+        ptr = int(data["ptr"])
+        size = int(data["size"])
+        proj_dim = int(data.get("proj_dim", buf.shape[1]))
+        max_size = int(data.get("max_size", buf.shape[0]))
+
+        # Adjust to current config if necessary
+        if proj_dim != self.proj_dim:
+            print(
+                f"[EpisodicBuffer] Warning: proj_dim mismatch "
+                f"(file={proj_dim}, current={self.proj_dim}). Skipping load."
+            )
+            return
+
+        n = min(size, self.max_size, buf.shape[0])
+
+        self.buffer[:n] = buf[:n]
+        self.size = n
+        self.ptr = ptr % self.max_size

@@ -1,81 +1,77 @@
-import time
-import numpy as np
-from typing import Dict, List, Any, Tuple
+import os
+import json
+from typing import List, Dict, Any
 
 
 class TextMemory:
     """
-    Stores textual observations from OCR:
-        text, bbox, center, attention score, embedding, timestamp
+    Very simple text memory:
+      - stores a list of screen text entries with bbox, center, score
+      - used as a high-level semantic trace of what the agent has seen
 
-    Supports:
-      - add(entry)
-      - get_recent()
-      - find_by_text(query)
-      - clear_old(max_age)
+    Now with save/load support for persistence.
     """
 
-    def __init__(self, max_items=200, decay_seconds=20.0):
+    def __init__(self, max_items: int = 10000):
         self.max_items = max_items
-        self.decay_seconds = decay_seconds
-        self.items: List[Dict[str, Any]] = []
+        self.entries: List[Dict[str, Any]] = []
 
-    def add(self, text: str, bbox, center, score: float, embedding=None):
-        timestamp = time.time()
-
+    # ----------------------------------------------------------
+    def add(
+        self,
+        text: str,
+        bbox,
+        center,
+        score: float,
+        embedding=None,
+    ):
+        """
+        Store a single text observation.
+        bbox, center should be JSON-serializable (e.g. lists or tuples).
+        """
         entry = {
-            "text": text,
-            "bbox": bbox,
-            "center": center,
-            "score": score,
-            "embedding": embedding,
-            "timestamp": timestamp,
+            "text": str(text),
+            "bbox": list(bbox) if bbox is not None else None,
+            "center": list(center) if center is not None else None,
+            "score": float(score),
         }
+        # Embedding is optional and currently unused (we set None everywhere)
+        if embedding is not None:
+            try:
+                entry["embedding"] = list(embedding)
+            except Exception:
+                entry["embedding"] = None
 
-        self.items.append(entry)
+        self.entries.append(entry)
 
-        # Keep memory bounded
-        if len(self.items) > self.max_items:
-            self.items.pop(0)
+        # Truncate if too large
+        if len(self.entries) > self.max_items:
+            self.entries = self.entries[-self.max_items :]
 
-    def clear_old(self):
-        """Remove entries older than decay_seconds."""
-        now = time.time()
-        self.items = [
-            it for it in self.items
-            if (now - it["timestamp"]) <= self.decay_seconds
-        ]
+    # ----------------------------------------------------------
+    def all(self) -> List[Dict[str, Any]]:
+        return self.entries
 
-    def get_recent(self) -> List[Dict[str, Any]]:
-        """Return still-valid entries."""
-        self.clear_old()
-        return list(self.items)
+    # ----------------------------------------------------------
+    # Persistence helpers
+    # ----------------------------------------------------------
+    def to_list(self) -> List[Dict[str, Any]]:
+        return self.entries
 
-    def find_closest_text(self, query: str) -> Dict[str, Any]:
-        """
-        Naive string similarity for now.
-        (Later we integrate text embeddings + patch embeddings.)
-        """
-        query = query.lower().strip()
-        best = None
-        best_score = 0.0
+    def from_list(self, data: List[Dict[str, Any]]):
+        if data is None:
+            self.entries = []
+        else:
+            self.entries = list(data)
 
-        for it in self.get_recent():
-            t = it["text"].lower().strip()
-            if not t:
-                continue
-            # simple similarity: shared chars
-            sim = self._char_overlap(query, t)
-            if sim > best_score:
-                best_score = sim
-                best = it
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.entries, f, ensure_ascii=False, indent=2)
 
-        return best
-
-    @staticmethod
-    def _char_overlap(a: str, b: str) -> float:
-        set_a = set(a)
-        set_b = set(b)
-        if not set_a or not set_b:
-            return 0.0
-        return len(set_a & set_b) / len(set_a | set_b)
+    def load(self, path: str):
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.from_list(data)

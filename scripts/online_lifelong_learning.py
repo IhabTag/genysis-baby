@@ -1,6 +1,6 @@
 import os
 import sys
-import time
+import json
 import torch
 import numpy as np
 
@@ -29,11 +29,9 @@ def unwrap_obs(obs):
       - obs = {"obs": ndarray, "t": ...}
     """
     if isinstance(obs, dict):
-        # Common key
         if "image" in obs:
             return obs["image"]
 
-        # Fallback: auto-detect the first 3D ndarray
         for v in obs.values():
             if isinstance(v, np.ndarray) and v.ndim == 3:
                 return v
@@ -86,19 +84,79 @@ def train_step(world_model, optimizer, frame_t, frame_next, act_vec, device):
 
 
 # ------------------------------------------------------
-# Main loop
+# Age persistence helpers
+# ------------------------------------------------------
+def load_age(state_dir: str):
+    """
+    Load total_episodes and total_steps from age.json if present.
+    Returns (total_episodes, total_steps).
+    """
+    path = os.path.join(state_dir, "age.json")
+    if not os.path.exists(path):
+        return 0, 0
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        total_episodes = int(data.get("total_episodes", 0))
+        total_steps = int(data.get("total_steps", 0))
+        return total_episodes, total_steps
+    except Exception as e:
+        print(f"[age] Warning: failed to load age.json: {e}")
+        return 0, 0
+
+
+def save_age(state_dir: str, total_episodes: int, total_steps: int):
+    """
+    Save total_episodes and total_steps to age.json.
+    Also stores a derived estimated cognitive age in months.
+    """
+    path = os.path.join(state_dir, "age.json")
+    os.makedirs(state_dir, exist_ok=True)
+
+    # Heuristic: every 50k steps ≈ 1 human cognitive month
+    estimated_months = total_steps / 50_000.0
+    data = {
+        "total_episodes": total_episodes,
+        "total_steps": total_steps,
+        "estimated_cognitive_age_months": estimated_months,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def pretty_age(total_steps: int):
+    """
+    Make a small human-readable age estimate from total_steps.
+    """
+    months = total_steps / 50_000.0
+    years = months / 12.0
+    return years, months
+
+
+# ------------------------------------------------------
+# Main loop (persistent lifelong learning)
 # ------------------------------------------------------
 def main():
     device = "cpu"
     print(f"Starting online lifelong learning on device={device} ...")
 
-    # Load world model
-    ckpt_path = "checkpoints/world_model_contrastive.pt"
-    print("Loading checkpoint:", ckpt_path)
-    world_model = WorldModel()
-    world_model.load_state_dict(torch.load(ckpt_path, map_location=device), strict=False)
-    world_model = world_model.to(device)
+    CKPT_PATH = "checkpoints/world_model_contrastive.pt"
+    STATE_DIR = "state"
 
+    os.makedirs(os.path.dirname(CKPT_PATH), exist_ok=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+    # Load world model
+    world_model = WorldModel()
+    if os.path.exists(CKPT_PATH):
+        print("Loading checkpoint:", CKPT_PATH)
+        sd = torch.load(CKPT_PATH, map_location=device)
+        world_model.load_state_dict(sd, strict=False)
+    else:
+        print("No checkpoint found, starting from scratch.")
+
+    world_model = world_model.to(device)
     optimizer = torch.optim.Adam(world_model.parameters(), lr=1e-4)
 
     # Create environment
@@ -112,11 +170,24 @@ def main():
         device=device,
         max_memory=1500,
         epsilon=0.05,
+        proj_dim=64,
+    )
+
+    # Load persistent agent state (episodic + text + goals + meta)
+    agent.load_state(STATE_DIR)
+    print("Loaded agent state from", STATE_DIR)
+
+    # Load age
+    total_episodes, total_steps = load_age(STATE_DIR)
+    years, months = pretty_age(total_steps)
+    print(
+        f"[age] Loaded age.json → episodes={total_episodes}, "
+        f"steps={total_steps}, ~{months:.2f} months (~{years:.2f} years)"
     )
 
     num_episodes = 999999
 
-    for ep in range(1, num_episodes + 1):
+    for ep in range(total_episodes + 1, total_episodes + 1 + num_episodes):
         print(f"\n=== EPISODE {ep} ===")
 
         obs = env.reset(meta={"episode": ep})
@@ -158,13 +229,31 @@ def main():
             # Advance
             frame = next_frame
             step += 1
+            total_steps += 1  # ✅ global age counter
 
             if step % 10 == 0:
                 print(
-                    f"[ep {ep}] step={step} loss={loss:.4f} curiosity={curiosity:.4f}"
+                    f"[ep {ep}] step={step} loss={loss:.4f} curiosity={curiosity:.4f} "
+                    f"(global_steps={total_steps})"
                 )
 
-        print(f"Episode {ep} finished.\n")
+        # Episode finished
+        total_episodes += 1
+
+        # Save model + agent brain
+        torch.save(world_model.state_dict(), CKPT_PATH)
+        agent.save_state(STATE_DIR)
+
+        # Save age
+        save_age(STATE_DIR, total_episodes, total_steps)
+        years, months = pretty_age(total_steps)
+
+        print(
+            f"Episode {ep} finished. "
+            f"Total episodes={total_episodes}, total steps={total_steps}, "
+            f"estimated cognitive age ≈ {months:.2f} months (~{years:.2f} years). "
+            f"State + age saved.\n"
+        )
 
 
 if __name__ == "__main__":

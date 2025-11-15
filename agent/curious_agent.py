@@ -1,3 +1,5 @@
+import os
+import json
 import numpy as np
 import torch
 import cv2
@@ -16,7 +18,7 @@ from agent.goal_head import GoalCuriosityHead
 
 class CuriousAgent:
     """
-    Redesigned curiosity-driven agent.
+    Redesigned curiosity-driven agent with persistent memory.
 
     Curiosity score per candidate action is a mixture of:
       1) Latent change       : ||p_{t+1} - p_t||^2
@@ -30,6 +32,13 @@ class CuriousAgent:
       - Structured action proposals (regions, scroll, text-targeted clicks)
       - Boredom detection and escape actions
       - Diversity penalty for repeating same action type
+
+    New:
+      - save_state / load_state for:
+          * episodic memory
+          * text memory
+          * goal memory
+          * action stats
     """
 
     def __init__(
@@ -48,6 +57,7 @@ class CuriousAgent:
         epsilon: float = 0.05,
         boredom_window: int = 50,
         boredom_factor: float = 0.5,
+        proj_dim: int = 64,
     ):
         """
         Args:
@@ -60,6 +70,7 @@ class CuriousAgent:
           epsilon: epsilon-greedy random exploration
           boredom_window: how many past curiosity scores to consider
           boredom_factor: threshold ratio for boredom
+          proj_dim: projection dimension for episodic memory
         """
         self.world_model = world_model.to(device)
         self.world_model.eval()
@@ -69,7 +80,11 @@ class CuriousAgent:
         self.device = device
 
         # Episodic memory on projection space
-        self.memory = EpisodicBuffer(max_size=max_memory, device=device)
+        self.memory = EpisodicBuffer(
+            max_size=max_memory,
+            device=device,
+            proj_dim=proj_dim,
+        )
 
         # Visual attention
         self.att_module = SaliencyAttention()
@@ -187,25 +202,22 @@ class CuriousAgent:
             )
 
         # 3) Region-focused moves (top bar, left panel, center)
-        # Top bar
         candidates.append(
-            {
+            {  # Top bar
                 "type": "MOVE_MOUSE",
                 "x": random.randint(0, width - 1),
                 "y": random.randint(0, int(height * 0.15)),
             }
         )
-        # Left panel
         candidates.append(
-            {
+            {  # Left panel
                 "type": "MOVE_MOUSE",
                 "x": random.randint(0, int(width * 0.2)),
                 "y": random.randint(0, height - 1),
             }
         )
-        # Center
         candidates.append(
-            {
+            {  # Center
                 "type": "MOVE_MOUSE",
                 "x": random.randint(int(width * 0.3), int(width * 0.7)),
                 "y": random.randint(int(height * 0.3), int(height * 0.7)),
@@ -460,7 +472,7 @@ class CuriousAgent:
         return best_action, best_score
 
     # --------------------------------------------------------
-    # Helper for other modules: get visible text
+    # Helper: get visible text
     # --------------------------------------------------------
     @torch.no_grad()
     def get_visible_text(self, frame: np.ndarray) -> List[Dict[str, Any]]:
@@ -468,3 +480,62 @@ class CuriousAgent:
         Returns OCR/interpreter elements for debugging or higher-level reasoning.
         """
         return self.screen_interpreter.interpret(frame)
+
+    # --------------------------------------------------------
+    # Persistence API (full agent state)
+    # --------------------------------------------------------
+    def save_state(self, state_dir: str):
+        """
+        Save episodic memory, text memory, goal memory, and agent meta.
+        """
+        os.makedirs(state_dir, exist_ok=True)
+
+        # 1) Episodic memory
+        epi_path = os.path.join(state_dir, "episodic_memory.npz")
+        self.memory.save(epi_path)
+
+        # 2) Text memory
+        text_path = os.path.join(state_dir, "text_memory.json")
+        self.text_memory.save(text_path)
+
+        # 3) Goal memory
+        goal_path = os.path.join(state_dir, "goal_memory.json")
+        self.goal_head.save(goal_path)
+
+        # 4) Agent meta
+        meta = {
+            "action_counts": self.action_counts,
+            "last_action_type": self.last_action_type,
+            "recent_scores": list(self.recent_scores),
+        }
+        meta_path = os.path.join(state_dir, "agent_meta.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    def load_state(self, state_dir: str):
+        """
+        Load episodic memory, text memory, goal memory, and agent meta
+        if present. Safe if files missing.
+        """
+        # 1) Episodic memory
+        epi_path = os.path.join(state_dir, "episodic_memory.npz")
+        self.memory.load(epi_path)
+
+        # 2) Text memory
+        text_path = os.path.join(state_dir, "text_memory.json")
+        self.text_memory.load(text_path)
+
+        # 3) Goal memory
+        goal_path = os.path.join(state_dir, "goal_memory.json")
+        self.goal_head.load(goal_path)
+
+        # 4) Agent meta
+        meta_path = os.path.join(state_dir, "agent_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            self.action_counts = meta.get("action_counts", {})
+            self.last_action_type = meta.get("last_action_type", None)
+            self.recent_scores.clear()
+            for s in meta.get("recent_scores", []):
+                self.recent_scores.append(float(s))
