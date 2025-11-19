@@ -3,7 +3,6 @@ import sys
 import json
 import torch
 import numpy as np
-import argparse
 
 # ------------------------------------------------------------
 # Ensure project root is importable
@@ -13,12 +12,9 @@ sys.path.insert(0, ROOT)
 
 from env.computer_env import ComputerEnv
 from agent.curious_agent import CuriousAgent
-from agent.hierarchical_agent import HierarchicalAgent
 from models.world_model import WorldModel
-from models.temporal_brain import TemporalBrain
 from models.utils.preprocessing import preprocess_frame, encode_action
 from agent.random_agent import random_action
-from agent.option_policy import OptionLibrary, create_default_options
 
 
 # ------------------------------------------------------------
@@ -142,24 +138,8 @@ def pretty_age(total_steps: int):
 # Main loop (persistent lifelong learning)
 # ------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Online lifelong learning for GENYSIS-BABY")
-    parser.add_argument('--device', type=str, default='cpu', help='Device (cpu/cuda)')
-    parser.add_argument('--use-temporal', action='store_true', default=True, help='Enable temporal brain (default: True)')
-    parser.add_argument('--no-temporal', action='store_false', dest='use_temporal', help='Disable temporal brain')
-    parser.add_argument('--use-hierarchical', action='store_true', default=True, help='Enable hierarchical agent (default: True)')
-    parser.add_argument('--no-hierarchical', action='store_false', dest='use_hierarchical', help='Disable hierarchical agent')
-    parser.add_argument('--option-library', type=str, default=None, 
-                       help='Path to trained option library (for hierarchical mode)')
-    parser.add_argument('--episodes', type=int, default=999999, help='Number of episodes to run')
-    parser.add_argument('--fast-mode', action='store_true', default=True, help='Fast mode (skip OCR on predictions)')
-    
-    args = parser.parse_args()
-    
-    device = args.device
-    print(f"Starting online lifelong learning on device={device}")
-    print(f"  Temporal brain: {args.use_temporal}")
-    print(f"  Hierarchical agent: {args.use_hierarchical}")
-    print(f"  Fast mode: {args.fast_mode}")
+    device = "cpu"
+    print(f"Starting online lifelong learning on device={device} ...")
 
     CKPT_PATH = "checkpoints/world_model_contrastive.pt"
     STATE_DIR = "state"
@@ -168,40 +148,10 @@ def main():
     os.makedirs(STATE_DIR, exist_ok=True)
 
     # Load world model
-    world_model = WorldModel(action_dim=7)
+    world_model = WorldModel()
     if os.path.exists(CKPT_PATH):
         print("Loading checkpoint:", CKPT_PATH)
         sd = torch.load(CKPT_PATH, map_location=device)
-        
-        # Check for dimension mismatch in dynamics model
-        if 'dynamics.0.weight' in sd:
-            saved_weight = sd['dynamics.0.weight']
-            current_weight = world_model.dynamics[0].weight
-            
-            if saved_weight.shape != current_weight.shape:
-                print(f"Warning: Shape mismatch in dynamics model ({saved_weight.shape} vs {current_weight.shape}). Adapting weights...")
-                
-                # Create new weight tensor with current shape
-                new_weight = current_weight.data.clone()
-                
-                # Assuming latent_dim=256 is first part of input
-                latent_dim = 256
-                
-                # Copy latent part (0:256)
-                new_weight[:, :latent_dim] = saved_weight[:, :latent_dim]
-                
-                # Copy old action part (256:256+6)
-                # Old shape was [256, 262], so action part is 256:262
-                # New shape is [256, 263]
-                old_action_dim = saved_weight.shape[1] - latent_dim
-                new_weight[:, latent_dim:latent_dim+old_action_dim] = saved_weight[:, latent_dim:]
-                
-                # Zero out the new action dimension(s)
-                new_weight[:, latent_dim+old_action_dim:].zero_()
-                
-                # Update state dict
-                sd['dynamics.0.weight'] = new_weight
-                
         world_model.load_state_dict(sd, strict=False)
     else:
         print("No checkpoint found, starting from scratch.")
@@ -212,107 +162,22 @@ def main():
     # Create environment
     env = ComputerEnv(width=1024, height=768, max_steps=150)
 
-    # Create temporal brain if requested
-    temporal_brain = None
-    if args.use_temporal:
-        print("Creating temporal brain (GRU)...")
-        temporal_brain = TemporalBrain(
-            latent_dim=256,
-            action_dim=7,
-            hidden_dim=256,
-            context_dim=128,
-            model_type="gru"
-        )
-        temporal_brain = temporal_brain.to(device)
-        temporal_brain.eval()
-        
-        # Try to load temporal brain state
-        temporal_path = os.path.join(STATE_DIR, "temporal_brain.pt")
-        if os.path.exists(temporal_path):
-            checkpoint = torch.load(temporal_path, map_location=device)
-            sd = checkpoint['model_state_dict']
-            
-            # Handle weight mismatch for RNN input layer
-            if 'rnn.weight_ih_l0' in sd:
-                saved_weight = sd['rnn.weight_ih_l0']
-                current_weight = temporal_brain.rnn.weight_ih_l0
-                
-                if saved_weight.shape != current_weight.shape:
-                    print(f"Warning: Shape mismatch in TemporalBrain ({saved_weight.shape} vs {current_weight.shape}). Adapting weights...")
-                    
-                    # Create new weight tensor
-                    new_weight = current_weight.data.clone()
-                    
-                    # Input is [latent_dim, action_dim]
-                    # RNN weight_ih is [3*hidden, input_dim] (for GRU)
-                    latent_dim = 256
-                    old_action_dim = saved_weight.shape[1] - latent_dim
-                    
-                    # Copy latent part
-                    new_weight[:, :latent_dim] = saved_weight[:, :latent_dim]
-                    
-                    # Copy old action part
-                    new_weight[:, latent_dim:latent_dim+old_action_dim] = saved_weight[:, latent_dim:]
-                    
-                    # Zero new action part
-                    new_weight[:, latent_dim+old_action_dim:].zero_()
-                    
-                    sd['rnn.weight_ih_l0'] = new_weight
-            
-            temporal_brain.load_state_dict(sd, strict=False)
-            # Reset hidden state to avoid shape mismatch there too
-            temporal_brain.reset_hidden() 
-            print(f"Loaded temporal brain from {temporal_path}")
+    # Create agent (FAST MODE)
+    agent = CuriousAgent(
+        world_model=world_model,
+        action_generator=lambda: random_action(width=1024, height=768),
+        n_candidates=4,          # fewer candidates → faster
+        device=device,
+        max_memory=1500,
+        epsilon=0.05,
+        proj_dim=64,
+        fast_mode=True,         # skip OCR+goal on predictions
+        mem_sample_size=512,    # sample episodic memory for novelty
+    )
 
-    # Create agent
-    if args.use_hierarchical:
-        # Load or create option library
-        if args.option_library and os.path.exists(args.option_library):
-            print(f"Loading option library from {args.option_library}...")
-            option_library = OptionLibrary(device=device)
-            option_library.load(args.option_library)
-        else:
-            print("Creating default option library...")
-            option_library = create_default_options(device=device)
-        
-        print(f"Creating hierarchical agent with {len(option_library)} options...")
-        agent = HierarchicalAgent(
-            world_model=world_model,
-            option_library=option_library,
-            temporal_brain=temporal_brain,
-            device=device,
-            max_option_steps=30,  # Shorter options for more variety
-            epsilon=0.2,  # More random exploration
-            curiosity_weight=2.0,  # Higher curiosity
-            novelty_weight=1.5,  # Higher novelty seeking
-            diversity_bonus=0.5,  # Encourage trying different options
-            exploration_boost=1.5  # Boost early exploration
-        )
-        
-        # Load agent state
-        agent.load_state(STATE_DIR)
-        print("Loaded hierarchical agent state from", STATE_DIR)
-        
-    else:
-        # Standard curious agent
-        print("Creating standard curious agent...")
-        agent = CuriousAgent(
-            world_model=world_model,
-            action_generator=lambda: random_action(width=1024, height=768),
-            n_candidates=4,
-            device=device,
-            max_memory=1500,
-            epsilon=0.05,
-            proj_dim=64,
-            fast_mode=args.fast_mode,
-            mem_sample_size=512,
-            temporal_brain=temporal_brain,
-            use_episodic_retrieval=args.use_temporal
-        )
-        
-        # Load persistent agent state
-        agent.load_state(STATE_DIR)
-        print("Loaded agent state from", STATE_DIR)
+    # Load persistent agent state (episodic + text + goals + meta)
+    agent.load_state(STATE_DIR)
+    print("Loaded agent state from", STATE_DIR)
 
     # Load age
     total_episodes, total_steps = load_age(STATE_DIR)
@@ -322,7 +187,7 @@ def main():
         f"steps={total_steps}, ~{months:.2f} months (~{years:.2f} years)"
     )
 
-    num_episodes = args.episodes
+    num_episodes = 999999
 
     for ep in range(total_episodes + 1, total_episodes + 1 + num_episodes):
         print(f"\n=== EPISODE {ep} ===")
@@ -338,15 +203,7 @@ def main():
 
         while not done:
             # Agent decides action
-            if args.use_hierarchical:
-                action, info = agent.step(frame, screen_width=1024, screen_height=768)
-                curiosity = 0.0  # Hierarchical agent doesn't return curiosity score
-                
-                # Print option info occasionally
-                if step % 1 == 0 and info.get('option'):
-                    print(f"  [Hierarchical] Option: {info['option']}, step: {info['option_step']}")
-            else:
-                action, curiosity = agent.select_action(frame)
+            action, curiosity = agent.select_action(frame)
 
             # Encode action for world model
             act_vec = encode_action(
@@ -368,16 +225,15 @@ def main():
                 act_vec, device
             )
 
-            # Update memory (only for standard agent)
-            if not args.use_hierarchical:
-                agent.remember_state(frame)
+            # Update memory
+            agent.remember_state(frame)
 
             # Advance
             frame = next_frame
             step += 1
             total_steps += 1  # global age counter
 
-            if step % 1 == 0:
+            if step % 10 == 0:
                 print(
                     f"[ep {ep}] step={step} loss={loss:.4f} curiosity={curiosity:.4f} "
                     f"(global_steps={total_steps})"
@@ -389,11 +245,6 @@ def main():
         # Save model + agent brain
         torch.save(world_model.state_dict(), CKPT_PATH)
         agent.save_state(STATE_DIR)
-        
-        # Save temporal brain if used
-        if temporal_brain is not None:
-            temporal_path = os.path.join(STATE_DIR, "temporal_brain.pt")
-            temporal_brain.save_state(temporal_path)
 
         # Save age
         save_age(STATE_DIR, total_episodes, total_steps)

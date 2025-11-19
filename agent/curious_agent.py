@@ -12,7 +12,6 @@ from models.utils.attention import SaliencyAttention
 from models.utils.ocr import run_ocr_with_boxes
 from memory.episodic_buffer import EpisodicBuffer
 from memory.text_memory import TextMemory
-from memory.episodic_retrieval import EpisodicRetrieval
 from agent.screen_interpreter import ScreenInterpreter
 from agent.goal_head import GoalCuriosityHead
 
@@ -57,15 +56,12 @@ class CuriousAgent:
         text_weight: float = 0.8,
         layout_weight: float = 0.3,
         goal_weight: float = 0.8,
-        temporal_weight: float = 0.3,  # NEW: weight for temporal context
         epsilon: float = 0.05,
         boredom_window: int = 50,
         boredom_factor: float = 0.5,
         proj_dim: int = 64,
         fast_mode: bool = True,
         mem_sample_size: int = 512,
-        temporal_brain=None,           # NEW: TemporalBrain instance
-        use_episodic_retrieval: bool = True,  # NEW: enable episodic retrieval
     ):
         """
         Args:
@@ -110,7 +106,6 @@ class CuriousAgent:
         self.text_weight = text_weight
         self.layout_weight = layout_weight
         self.goal_weight = goal_weight
-        self.temporal_weight = temporal_weight  # NEW
 
         # Exploration
         self.epsilon = epsilon
@@ -129,27 +124,6 @@ class CuriousAgent:
         # Speed / performance knobs
         self.fast_mode = fast_mode
         self.mem_sample_size = mem_sample_size
-
-        # NEW: Temporal brain for working memory
-        self.temporal_brain = temporal_brain
-        if self.temporal_brain is not None:
-            self.temporal_brain.to(device)
-            self.temporal_brain.eval()
-
-        # NEW: Episodic retrieval for historical context
-        self.episodic_retrieval = None
-        if use_episodic_retrieval:
-            self.episodic_retrieval = EpisodicRetrieval(
-                self.memory,
-                retrieval_k=5,
-                context_dim=128,
-                use_learned_aggregation=False  # Start with simple averaging
-            )
-
-        # NEW: Track last state for temporal continuity
-        self.last_z: Optional[torch.Tensor] = None
-        self.last_action_vec: Optional[torch.Tensor] = None
-        self.last_context: Optional[torch.Tensor] = None
 
     # --------------------------------------------------------
     # Utility: text signatures
@@ -352,17 +326,6 @@ class CuriousAgent:
         z_t = self.world_model.encode(img_t)        # (1,latent)
         p_t = self.world_model.project(z_t)         # (1,proj_dim)
 
-        # NEW: Get temporal context from working memory
-        c_t = None
-        if self.temporal_brain is not None and self.last_z is not None and self.last_action_vec is not None:
-            c_t, _ = self.temporal_brain(self.last_z, self.last_action_vec)
-            self.last_context = c_t
-
-        # NEW: Retrieve relevant historical experiences
-        r_t = None
-        if self.episodic_retrieval is not None:
-            r_t = self.episodic_retrieval.retrieve(p_t)
-
         # Episodic memory tensor (possibly sampled)
         mem_tensor = self.memory.get_memory_tensor(sample_size=self.mem_sample_size)
 
@@ -453,14 +416,6 @@ class CuriousAgent:
                 )
                 goal_curiosity = self.goal_head.compute_goal_curiosity(features_next)
 
-            # NEW: Temporal relevance (if temporal brain available)
-            temporal_score = 0.0
-            if c_t is not None:
-                # Measure how well this action aligns with recent context
-                # Simple heuristic: prefer actions that lead to states different from recent context
-                # This encourages exploration of new temporal patterns
-                temporal_score = latent_change  # Can be refined with learned metric
-
             # Combined curiosity
             score = (
                 self.latent_weight * latent_change
@@ -469,7 +424,6 @@ class CuriousAgent:
                 + self.text_weight * text_novelty
                 + self.layout_weight * layout_diff
                 + self.goal_weight * goal_curiosity
-                + self.temporal_weight * temporal_score
             )
 
             # Penalize repeating the same action type
@@ -527,15 +481,6 @@ class CuriousAgent:
             except Exception:
                 pass
 
-        # NEW: Update temporal state for next step
-        if self.temporal_brain is not None:
-            self.last_z = z_t.detach()
-            # Encode the selected action
-            best_act_vec_np = encode_action(best_action, screen_width=W, screen_height=H)
-            self.last_action_vec = torch.tensor(
-                best_act_vec_np, dtype=torch.float32, device=self.device
-            ).unsqueeze(0)
-
         return best_action, best_score
 
     # --------------------------------------------------------
@@ -581,11 +526,6 @@ class CuriousAgent:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
-        # NEW: 5) Temporal brain state
-        if self.temporal_brain is not None:
-            temporal_path = os.path.join(state_dir, "temporal_brain.pt")
-            self.temporal_brain.save_state(temporal_path)
-
     def load_state(self, state_dir: str):
         """
         Load episodic memory, text memory, goal memory, and agent meta
@@ -616,11 +556,3 @@ class CuriousAgent:
             # Respect persisted fast_mode / mem_sample_size if present
             self.fast_mode = bool(meta.get("fast_mode", self.fast_mode))
             self.mem_sample_size = int(meta.get("mem_sample_size", self.mem_sample_size))
-
-        # NEW: 5) Temporal brain state
-        if self.temporal_brain is not None:
-            temporal_path = os.path.join(state_dir, "temporal_brain.pt")
-            if os.path.exists(temporal_path):
-                from models.temporal_brain import TemporalBrain
-                self.temporal_brain = TemporalBrain.load_state(temporal_path, device=self.device)
-                self.temporal_brain.eval()
