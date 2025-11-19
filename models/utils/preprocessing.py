@@ -20,6 +20,9 @@ def preprocess_frame(frame: np.ndarray, size: int = 128) -> np.ndarray:
 
     Returns: np.ndarray of shape (3, size, size), dtype float32
     """
+    if frame is None:
+        return np.zeros((3, size, size), dtype=np.float32)
+        
     assert frame.ndim == 3 and frame.shape[2] == 3, "Expected RGB frame HxWx3"
 
     # Resize
@@ -27,6 +30,29 @@ def preprocess_frame(frame: np.ndarray, size: int = 128) -> np.ndarray:
     img = img.astype(np.float32) / 255.0  # [0,1]
     img = np.transpose(img, (2, 0, 1))    # HWC -> CHW
     return img
+
+
+def preprocess_frame_diff(frame_a: np.ndarray, frame_b: np.ndarray) -> float:
+    """
+    Compute normalized pixel difference between two RGB frames.
+
+    Returns:
+        float in [0, 1], higher = bigger change.
+    """
+    if frame_a is None or frame_b is None:
+        return 1.0
+
+    if frame_a.shape != frame_b.shape:
+        return 1.0
+
+    # Convert to grayscale for difference metric
+    gray_a = cv2.cvtColor(frame_a, cv2.COLOR_RGB2GRAY)
+    gray_b = cv2.cvtColor(frame_b, cv2.COLOR_RGB2GRAY)
+
+    diff = cv2.absdiff(gray_a, gray_b)
+    diff_norm = np.mean(diff) / 255.0  # normalize
+
+    return float(diff_norm)
 
 
 # ------------------------------------------------------------
@@ -43,46 +69,46 @@ ACTION_TYPES = [
 
 def encode_action(action: Dict[str, Any], screen_width: int = 1024, screen_height: int = 768) -> np.ndarray:
     """
-    Encode an action dict into a fixed-size vector of length 5.
+    Encode an action dict into a fixed-size vector of length 7.
 
-    We use:
-      - type_id_norm: scalar in [0,1] (action type index / (N-1))
-      - x_norm: x / screen_width  (0 if not applicable)
-      - y_norm: y / screen_height (0 if not applicable)
-      - scroll_norm: scroll amount / 100, clipped to [-1,1]
-      - text_len_norm: len(text) / 20, clipped to [0,1]
+    Vector components:
+    0: MOVE_MOUSE flag (1.0 if move, 0.0 otherwise)
+    1: x coordinate (normalized 0-1)
+    2: y coordinate (normalized 0-1)
+    3: LEFT_CLICK flag (1.0 if click, 0.0 otherwise)
+    4: RIGHT_CLICK flag (1.0 if click, 0.0 otherwise)
+    5: SCROLL amount (normalized -1 to 1)
+    6: TYPE_TEXT flag (1.0 if type, 0.0 otherwise)
 
-    This is simple but enough for the world model to correlate actions with effects.
+    This sparse encoding helps the world model distinguish distinct action types.
     """
+    vec = np.zeros(7, dtype=np.float32)
+    
     a_type = action.get("type", "NOOP")
-    if a_type in ACTION_TYPES:
-        type_idx = ACTION_TYPES.index(a_type)
-    else:
-        type_idx = 0
-
-    if len(ACTION_TYPES) > 1:
-        type_id_norm = type_idx / float(len(ACTION_TYPES) - 1)
-    else:
-        type_id_norm = 0.0
-
-    # Coordinates (if move)
-    x = float(action.get("x", 0.0))
-    y = float(action.get("y", 0.0))
-    x_norm = np.clip(x / max(screen_width, 1), 0.0, 1.0)
-    y_norm = np.clip(y / max(screen_height, 1), 0.0, 1.0)
-
-    # Scroll
-    scroll = float(action.get("amount", 0.0))
-    scroll_norm = np.clip(scroll / 100.0, -1.0, 1.0)
-
-    # Text length
-    text = action.get("text", "")
-    text_len_norm = np.clip(len(str(text)) / 20.0, 0.0, 1.0)
-
-    vec = np.array(
-        [type_id_norm, x_norm, y_norm, scroll_norm, text_len_norm],
-        dtype=np.float32,
-    )
+    
+    if a_type == "MOVE_MOUSE":
+        vec[0] = 1.0
+        x = float(action.get("x", 0.0))
+        y = float(action.get("y", 0.0))
+        vec[1] = np.clip(x / max(screen_width, 1), 0.0, 1.0)
+        vec[2] = np.clip(y / max(screen_height, 1), 0.0, 1.0)
+        
+    elif a_type == "LEFT_CLICK":
+        vec[3] = 1.0
+        
+    elif a_type == "RIGHT_CLICK":
+        vec[4] = 1.0
+        
+    elif a_type == "SCROLL":
+        amount = float(action.get("amount", 0.0))
+        # Normalize scroll: assuming typical range is -100 to 100 per step, but can be larger
+        # We clip to [-1, 1] to keep inputs stable
+        vec[5] = np.clip(amount / 100.0, -1.0, 1.0)
+        
+    elif a_type == "TYPE_TEXT":
+        vec[6] = 1.0
+        # Could encode text length here if needed, but binary flag is a good start
+        
     return vec
 
 
@@ -92,26 +118,6 @@ def encode_action(action: Dict[str, Any], screen_width: int = 1024, screen_heigh
 class ExperienceDataset(Dataset):
     """
     Loads experience transitions saved as compressed npz files.
-
-    Each file is expected to contain:
-      - obs_t:   HxWx3 RGB uint8
-      - obs_next: HxWx3 RGB uint8
-      - action: Python dict
-
-    The directory structure is:
-      root/
-        ep_000001/
-          step_000000.npz
-          step_000001.npz
-        ep_000002/
-          ...
-
-    Returns tuples:
-      (img_t, act_vec, img_next)
-
-      img_t:    torch.FloatTensor (3, size, size) in [0,1]
-      act_vec:  torch.FloatTensor (5,)
-      img_next: torch.FloatTensor (3, size, size) in [0,1]
     """
 
     def __init__(self, root_dir: str, img_size: int = 128):
@@ -144,65 +150,6 @@ class ExperienceDataset(Dataset):
         # Convert to torch tensors
         img_t_t = torch.from_numpy(img_t)           # (3, H, W)
         img_next_t = torch.from_numpy(img_next)     # (3, H, W)
-        act_vec_t = torch.from_numpy(act_vec)       # (5,)
+        act_vec_t = torch.from_numpy(act_vec)       # (7,)
 
         return img_t_t, act_vec_t, img_next_t
-
-def preprocess_frame(frame: np.ndarray, size: int = 128) -> np.ndarray:
-    """
-    Converts RGB frame (H,W,3) into (3,size,size) float32 normalized.
-    """
-    img = cv2.resize(frame, (size, size))
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))
-    return img
-
-
-def preprocess_frame_diff(frame_a: np.ndarray, frame_b: np.ndarray) -> float:
-    """
-    Compute normalized pixel difference between two RGB frames.
-
-    Returns:
-        float in [0, 1], higher = bigger change.
-    """
-    if frame_a is None or frame_b is None:
-        return 1.0
-
-    if frame_a.shape != frame_b.shape:
-        return 1.0
-
-    # Convert to grayscale for difference metric
-    gray_a = cv2.cvtColor(frame_a, cv2.COLOR_RGB2GRAY)
-    gray_b = cv2.cvtColor(frame_b, cv2.COLOR_RGB2GRAY)
-
-    diff = cv2.absdiff(gray_a, gray_b)
-    diff_norm = np.mean(diff) / 255.0  # normalize
-
-    return float(diff_norm)
-
-
-def encode_action(action: dict, screen_width: int, screen_height: int) -> np.ndarray:
-    """
-    Encode action dict into numerical vector.
-    """
-    vec = np.zeros(6, dtype=np.float32)
-
-    a_type = action.get("type", "")
-
-    if a_type == "MOVE_MOUSE":
-        vec[0] = 1.0
-        vec[1] = action.get("x", 0) / screen_width
-        vec[2] = action.get("y", 0) / screen_height
-
-    elif a_type == "LEFT_CLICK":
-        vec[3] = 1.0
-
-    elif a_type == "RIGHT_CLICK":
-        vec[4] = 1.0
-
-    elif a_type == "SCROLL":
-        vec[5] = action.get("amount", 0) / 100.0
-
-    # TYPE_TEXT not encoded yet (handled at high-level)
-    return vec
-
